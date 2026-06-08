@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
@@ -223,6 +224,7 @@ struct TTIRLinkExternalFunctionsPass
     registry.insert<mlir::tt::ttcore::TTCoreDialect>();
     registry.insert<mlir::tt::ttnn::TTNNDialect>();
     registry.insert<mlir::tt::ttkernel::TTKernelDialect>();
+    registry.insert<mlir::emitc::EmitCDialect>();
   }
 };
 
