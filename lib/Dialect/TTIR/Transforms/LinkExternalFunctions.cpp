@@ -14,6 +14,7 @@
 #include "ttmlir/Dialect/TTCore/IR/TTCore.h"
 #include "ttmlir/Dialect/TTIR/IR/TTIROps.h"
 #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
+#include "ttmlir/Dialect/TTKernel/IR/TTKernel.h"
 #include "ttmlir/Dialect/TTNN/IR/TTNN.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -215,6 +216,13 @@ struct TTIRLinkExternalFunctionsPass
       invokeOp.replaceAllUsesWith(callOp.getResults());
       invokeOp.erase();
     }
+  }
+
+  void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::tt::ttir::TTIRDialect>();
+    registry.insert<mlir::tt::ttcore::TTCoreDialect>();
+    registry.insert<mlir::tt::ttnn::TTNNDialect>();
+    registry.insert<mlir::tt::ttkernel::TTKernelDialect>();
   }
 };
 
