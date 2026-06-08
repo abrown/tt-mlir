@@ -2,9 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -19,6 +21,7 @@
 #include "ttmlir/Dialect/TTNN/IR/TTNN.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/Path.h"
 
 namespace mlir::tt::ttir {
@@ -154,6 +157,201 @@ mergeExternalModule(ModuleOp destModule,
   return renameMap;
 }
 
+// Extracts a scalar value from a 0-D or 1-D single-element ranked tensor
+// using `tensor.extract`. Returns an error if the tensor does not have
+// exactly one element.
+static llvm::Expected<Value> adaptTensorToScalar(OpBuilder &builder,
+                                                 Location loc, Value caller) {
+  assert(mlir::isa<RankedTensorType>(caller.getType()) &&
+         "expected caller to provide a ranked tensor for scalar argument");
+  auto ty = mlir::cast<RankedTensorType>(caller.getType());
+  if (ty.getNumElements() != 1) {
+    return llvm::createStringError(llvm::formatv(
+        "expected 0-D or 1-D ranked tensor for scalar argument: found {0}",
+        caller.getType()));
+  }
+  auto index = ValueRange{};
+  // A `tensor<1xT>` requires an index; `tensor<T>` does not.
+  if (ty.getRank() == 1) {
+    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+    index = ValueRange{zero};
+  }
+  return builder.create<tensor::ExtractOp>(loc, caller, index).getResult();
+}
+
+// Truncates `caller` to `calleeType` via `arith.trunci` when both are integer
+// types and the caller is at least as wide. Returns `caller` unchanged when
+// the types already match. Returns an error if the coercion is not valid.
+static llvm::Expected<Value> adaptIntegerWidth(OpBuilder &builder, Location loc,
+                                               Value caller, Type calleeType) {
+  if (caller.getType() == calleeType) {
+    return caller;
+  }
+  auto callerInt = mlir::dyn_cast<IntegerType>(caller.getType());
+  auto calleeInt = mlir::dyn_cast<IntegerType>(calleeType);
+  if (!callerInt || !calleeInt || callerInt.getWidth() < calleeInt.getWidth()) {
+    return llvm::createStringError(llvm::formatv(
+        "cannot coerce scalar type {0} to {1}", caller.getType(), calleeType));
+  }
+  return builder.create<arith::TruncIOp>(loc, calleeType, caller).getResult();
+}
+
+// Collapses an initial empty dimension: `tensor<1x...>` → `tensor<...>` via
+// `tensor.collapse_shape`. Returns `caller` unchanged if the caller type does
+// not have an initial empty dimension.
+static Value pruneEmptyDimension(OpBuilder &builder, Location loc, Value caller,
+                                 Type calleeType) {
+  auto callerType = mlir::cast<RankedTensorType>(caller.getType());
+  if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
+    assert(mlir::cast<RankedTensorType>(calleeType).getRank() ==
+               callerType.getRank() - 1 &&
+           "callee must have exactly one less dimension than caller");
+    auto collapsedShape = llvm::ArrayRef<int64_t>(
+        callerType.getShape().begin() + 1, callerType.getShape().end());
+    auto collapsedTy =
+        RankedTensorType::get(collapsedShape, callerType.getElementType());
+    auto reassoc = SmallVector<ReassociationIndices>{{0, 1}};
+    for (int64_t i = 2; i <= collapsedTy.getRank(); ++i) {
+      reassoc.push_back({i});
+    }
+    return builder.create<tensor::CollapseShapeOp>(loc, collapsedTy, caller,
+                                                   reassoc);
+  } else {
+    return caller;
+  }
+}
+
+// Adapts the arguments of a `ttir.invoke_external` op to match the callee
+// function parameter types:
+//
+//   - Tensors with concrete static shapes where the callee expects dynamic
+//     shapes (or a different encoding). These are bridged with `tensor.cast`.
+//   - Tensors with an initial empty dimension where the callee expects no such
+//     dimension. The empty dimension is pruned with `tensor.collapse_shape`.
+//   - 0-D or 1-D ranked tensors where the callee expects a bare scalar type.
+//     These are unwrapped with `tensor.extract`.
+//   - Wider integer types where the callee expects narrower integer types.
+//     These are coerced with `arith.trunci`.
+//
+// Returns the adapted argument values, or failure if arity does not match.
+static FailureOr<SmallVector<Value>>
+adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
+                     func::FuncOp calleeFunc) {
+  if (invokeOp.getArguments().size() != calleeFunc.getNumArguments()) {
+    return invokeOp.emitOpError()
+           << "argument count mismatch: caller provides "
+           << invokeOp.getArguments().size() << " argument(s) but callee '"
+           << calleeFunc.getSymName() << "' expects "
+           << calleeFunc.getNumArguments();
+  }
+
+  Location loc = invokeOp.getLoc();
+  SmallVector<Value> adaptedArgs;
+  adaptedArgs.reserve(calleeFunc.getNumArguments());
+
+  for (auto [callerArg, calleeParamType] :
+       llvm::zip(invokeOp.getArguments(), calleeFunc.getArgumentTypes())) {
+    Type callerArgType = callerArg.getType();
+    if (!isa<RankedTensorType>(calleeParamType) &&
+        isa<RankedTensorType>(callerArgType)) {
+      // Case: tensor → scalar.
+      auto scalar = adaptTensorToScalar(builder, loc, callerArg);
+      if (!scalar) {
+        return invokeOp.emitOpError() << llvm::toString(scalar.takeError());
+      }
+      // Case: wider int → narrower int.
+      auto coerced = adaptIntegerWidth(builder, loc, *scalar, calleeParamType);
+      if (!coerced) {
+        return invokeOp.emitOpError() << llvm::toString(coerced.takeError());
+      }
+      adaptedArgs.push_back(*coerced);
+    } else if (isa<RankedTensorType>(calleeParamType) &&
+               isa<RankedTensorType>(callerArgType) &&
+               callerArgType != calleeParamType) {
+      // Case: tensor<1xT> → tensor<?>.
+      callerArg = pruneEmptyDimension(builder, loc, callerArg, calleeParamType);
+      adaptedArgs.push_back(
+          builder.create<tensor::CastOp>(loc, calleeParamType, callerArg));
+    } else if (callerArgType != calleeParamType) {
+      // Case: unimplemented.
+      return invokeOp.emitOpError()
+             << "unimplement ABI detail: cannot yet adapt type "
+             << callerArgType << " to type " << calleeParamType;
+    } else {
+      // Case: types match; pass through unchanged.
+      adaptedArgs.push_back(callerArg);
+    }
+  }
+
+  return adaptedArgs;
+}
+
+// Expands the first dimension to an initial empty dimension: `tensor<...>` →
+// `tensor<1x...>` via `tensor.expand_shape`. This is the reverse of
+// `collapseEmptyDimension`. Returns `callee` unchanged if the caller type does
+// not require an initial empty dimension.
+static Value expandEmptyDimension(OpBuilder &builder, Location loc, Value callee,
+                               RankedTensorType callerType) {
+  if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
+    auto calleeType = cast<RankedTensorType>(callee.getType());
+    assert(callerType.getRank() == calleeType.getRank() + 1 &&
+           "callee must have exactly one less dimension than caller");
+    SmallVector<int64_t> expandedShape = {1};
+    expandedShape.append(calleeType.getShape().begin(),
+                         calleeType.getShape().end());
+    auto expandedTy =
+        RankedTensorType::get(expandedShape, callerType.getElementType());
+    auto reassoc = SmallVector<ReassociationIndices>{{0, 1}};
+    for (int64_t i = 2; i <= calleeType.getRank(); ++i) {
+      reassoc.push_back({i});
+    }
+    return builder.create<tensor::ExpandShapeOp>(loc, expandedTy, callee,
+                                                 reassoc);
+  } else {
+    return callee;
+  }
+}
+
+// Adapts the results of a `func.call` back to the types declared on the
+// originating `ttir.invoke_external` op. This is the reverse of
+// `adaptInputsToLinkAbi` for return values:
+//
+//   - Tensors with dynamic static shapes where the caller expects static
+//     shapes. These are bridged with `tensor.cast`.
+//   - Tensors where the caller expects an initial empty dimension. The empty
+//     dimension is added with `tensor.expand_shape`.
+//
+// The callee may return dynamic-shaped tensors while the surrounding IR
+// expects the concrete shapes declared on the invoke op. `tensor.cast` is
+// inserted where the types differ.
+//
+// Returns the adapted result values.
+static SmallVector<Value> adaptOutputsToLinkAbi(OpBuilder &builder,
+                                                ttir::InvokeExternalOp invokeOp,
+                                                func::CallOp callOp) {
+  Location loc = invokeOp.getLoc();
+  SmallVector<Value> adaptedResults;
+  adaptedResults.reserve(callOp.getNumResults());
+
+  for (auto [callResult, invokeResultType] :
+       llvm::zip(callOp.getResults(), invokeOp.getResultTypes())) {
+    if (callResult.getType() != invokeResultType) {
+      Value result = callResult;
+      if (isa<RankedTensorType>(invokeResultType)) {
+        result =
+            expandEmptyDimension(builder, loc, result,
+                              mlir::cast<RankedTensorType>(invokeResultType));
+      }
+      adaptedResults.push_back(
+          builder.create<tensor::CastOp>(loc, invokeResultType, result));
+    } else {
+      adaptedResults.push_back(callResult);
+    }
+  }
+
+  return adaptedResults;
+}
+
 struct TTIRLinkExternalFunctionsPass
     : public impl::TTIRLinkExternalFunctionsBase<
           TTIRLinkExternalFunctionsPass> {
@@ -208,23 +406,48 @@ struct TTIRLinkExternalFunctionsPass
         finalEntry = it->second;
       }
 
-      // Replace `ttir.invoke_external` with `func.call`.
-      OpBuilder builder(invokeOp);
-      auto callOp = builder.create<func::CallOp>(invokeOp.getLoc(), finalEntry,
-                                                 invokeOp.getResultTypes(),
-                                                 invokeOp.getArguments());
+      // Look up the callee function now that it has been merged into the
+      // target module (its name may have been rewritten).
+      auto calleeFunc = dyn_cast_or_null<func::FuncOp>(
+          SymbolTable::lookupSymbolIn(targetModule, finalEntry));
+      if (!calleeFunc) {
+        invokeOp.emitOpError()
+            << "entry symbol '" << finalEntry << "' not found in module";
+        return signalPassFailure();
+      }
 
-      invokeOp.replaceAllUsesWith(callOp.getResults());
+      // Replace the `ttir.invoke_external` op with a `func.call`. We adapt
+      // the values to a "link ABI":
+      // - we expect input and output tensors of the callee to have a dynamic
+      //   shape (`tensor<?x?xf32>`); prior to the `func.call`, we
+      //   `tensor.cast` from/to the concrete static shapes given to
+      //   `ttir.invoke_external`.
+      // - we expect scalars in the callee to be wrapped by 0D tensors
+      //   (`tensor<f32>`); prior to the `func.call`, we `tensor.extract`
+      //   them.
+      OpBuilder builder(invokeOp);
+      auto adaptedArgsOrErr =
+          adaptInputsToLinkAbi(builder, invokeOp, calleeFunc);
+      if (failed(adaptedArgsOrErr)) {
+        return signalPassFailure();
+      }
+      auto callOp = builder.create<func::CallOp>(
+          invokeOp.getLoc(), calleeFunc.getSymName(),
+          calleeFunc.getResultTypes(), *adaptedArgsOrErr);
+      auto bridgedResults = adaptOutputsToLinkAbi(builder, invokeOp, callOp);
+      invokeOp.replaceAllUsesWith(bridgedResults);
       invokeOp.erase();
     }
   }
 
   void getDependentDialects(mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::arith::ArithDialect>();
     registry.insert<mlir::tt::ttir::TTIRDialect>();
     registry.insert<mlir::tt::ttcore::TTCoreDialect>();
     registry.insert<mlir::tt::ttnn::TTNNDialect>();
     registry.insert<mlir::tt::ttkernel::TTKernelDialect>();
     registry.insert<mlir::emitc::EmitCDialect>();
+    registry.insert<mlir::tensor::TensorDialect>();
   }
 };
 

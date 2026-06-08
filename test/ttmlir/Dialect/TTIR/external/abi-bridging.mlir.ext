@@ -1,0 +1,39 @@
+// This file is meant to be injected via `ttir.invoke_external`; the `.ext`
+// extension suffix prevents llvm-lit from parsing it directly.
+//
+// Contains entry points used by abi-bridging.mlir:
+//   @dynamic_kernel  – expects dynamic-shaped tensors and bare scalars.
+//   @passthrough     – expects the exact same tensor type as the caller.
+//   @flagged_kernel  – expects a tensor<?x?xf32> and a bare i1 flag.
+//   @scale_kernel    – expects a bare f32 scalar and a tensor<?x?xf32>.
+//   @prefix_kernel   – expects a 2-D dynamic tensor<?x?xf16>.
+
+module {
+  // Entry point whose parameters differ from what the XLA caller provides:
+  //   - tensor arguments use dynamic shapes instead of static
+  //   - scalar arguments are bare (i32) instead of 0-D tensors
+  func.func @dynamic_kernel(%mat: tensor<?x?xf32>, %n: i32) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
+  }
+
+  // Entry point whose parameter and result types exactly match the caller;
+  // no bridging ops should be emitted.
+  func.func @passthrough(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    return %arg0 : tensor<4x4xf32>
+  }
+
+  // Entry point for Case 5: bare i1 flag (caller provides tensor<i64>).
+  func.func @flagged_kernel(%mat: tensor<?x?xf32>, %flag: i1) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
+  }
+
+  // Entry point for Case 6: bare f32 scalar (caller provides tensor<1xf32>).
+  func.func @scale_kernel(%scale: f32, %mat: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
+  }
+
+  // Entry point for Case 7: 2-D dynamic tensor (caller provides tensor<1x4x8xf16>).
+  func.func @prefix_kernel(%mat: tensor<?x?xf16>) -> tensor<?x?xf16> {
+    return %mat : tensor<?x?xf16>
+  }
+}
