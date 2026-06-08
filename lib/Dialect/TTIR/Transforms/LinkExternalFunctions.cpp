@@ -359,10 +359,11 @@ struct TTIRLinkExternalFunctionsPass
   void runOnOperation() final {
     ModuleOp moduleOp = getOperation();
 
-    // Cache: path → `renameMap` produced when that external module was merged.
-    // Each external module is parsed and merged at most once regardless of how
-    // many `ttir.invoke_external` ops reference it.
-    llvm::StringMap<llvm::StringMap<std::string>> mergedPaths;
+    // Cache: (target ModuleOp) → (resolvedPath → renameMap).
+    // Each external module is parsed and merged at most once per target
+    // module regardless of how many `ttir.invoke_external` ops reference it.
+    llvm::DenseMap<ModuleOp, llvm::StringMap<llvm::StringMap<std::string>>>
+        mergedByModule;
 
     // Collect ops before walking to avoid mutation-during-walk issues.
     SmallVector<ttir::InvokeExternalOp> invokeOps;
@@ -371,10 +372,16 @@ struct TTIRLinkExternalFunctionsPass
     for (auto invokeOp : invokeOps) {
       StringRef path = invokeOp.getPath();
       StringRef entry = invokeOp.getEntry();
-      std::string resolvedPath = resolvePath(path, moduleOp);
 
+      // Merge into the nearest ModuleOp parent of the invoke op so that the
+      // resulting func.call can see the callee (MLIR symbol lookup does not
+      // cross module boundaries).
+      ModuleOp targetModule = invokeOp->getParentOfType<ModuleOp>();
+      std::string resolvedPath = resolvePath(path, targetModule);
+
+      auto &mergedPaths = mergedByModule[targetModule];
       if (!mergedPaths.contains(resolvedPath)) {
-        mlir::ParserConfig config(moduleOp.getContext());
+        mlir::ParserConfig config(targetModule.getContext());
         mlir::OwningOpRef<mlir::ModuleOp> externalModule =
             mlir::parseSourceFile<mlir::ModuleOp>(resolvedPath, config);
         if (!externalModule) {
@@ -389,7 +396,7 @@ struct TTIRLinkExternalFunctionsPass
           return signalPassFailure();
         }
 
-        auto renameMapOrErr = mergeExternalModule(moduleOp, externalModule);
+        auto renameMapOrErr = mergeExternalModule(targetModule, externalModule);
         if (failed(renameMapOrErr)) {
           invokeOp.emitOpError() << "failed to merge external module from '"
                                  << resolvedPath << "'";
@@ -399,7 +406,8 @@ struct TTIRLinkExternalFunctionsPass
         mergedPaths.try_emplace(resolvedPath, std::move(*renameMapOrErr));
       }
 
-      // Resolve the final name of the entry symbol, accounting for any rename.
+      // Resolve the final name of the entry symbol, accounting for any
+      // rename.
       const auto &renameMap = mergedPaths[resolvedPath];
       std::string finalEntry = entry.str();
       if (auto it = renameMap.find(entry); it != renameMap.end()) {
