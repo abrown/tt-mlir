@@ -11,6 +11,9 @@
 //   Case 5 (extract + trunci):     0-D wide-int tensor   → narrow scalar (i1)
 //   Case 6 (1D extract):           tensor<1xT>           → bare scalar T
 //   Case 7 (collapse + expand):    tensor<1x…> input/result → dynamic 2D
+//   Case 8 (extract + bitcast + extsi):  tensor<si32> → i64 (signed ext)
+//   Case 9 (extract + bitcast + extui):  tensor<ui32> → i64 (unsigned ext)
+//   Case 10 (extract + bitcast + trunci): tensor<si64> → i32 (truncation)
 
 module {
   // Cases 1, 2, and 3 are exercised together.
@@ -110,5 +113,74 @@ module {
          {path = "abi-bridging.mlir.ext", entry = "prefix_kernel"}
          : (tensor<1x4x8xf16>) -> tensor<1x4x8xf16>
     return %0 : tensor<1x4x8xf16>
+  }
+
+  // Case 8: tensor<si32> → i64 (sign-extend across a signedness boundary).
+  //
+  // The caller wraps a signed 32-bit integer in a 0-D tensor.  The callee
+  // expects a bare signless i64.  Bridging must:
+  //   1. Extract the si32 value from the 0-D tensor with tensor.extract.
+  //   2. Bitcast si32 → i32 (arith ops require signless operands).
+  //   3. Sign-extend i32 → i64 with arith.extsi (preserves the signed value).
+  // A warning is emitted about the signedness conversion.
+  //
+  // CHECK-LABEL: func.func @test_si32_to_i64
+  // CHECK:         tensor.extract {{.*}}[] : tensor<si32>
+  // CHECK:         builtin.unrealized_conversion_cast {{.*}} : si32 to i32
+  // CHECK:         arith.extsi {{.*}} : i32 to i64
+  // CHECK:         call @signed_ext_kernel
+  // CHECK:         tensor.cast {{.*}} : tensor<?x?xf32> to tensor<4x4xf32>
+  func.func @test_si32_to_i64(%flag: tensor<si32>,
+                               %mat: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %0 = "ttir.invoke_external"(%flag, %mat)
+         {path = "abi-bridging.mlir.ext", entry = "signed_ext_kernel"}
+         : (tensor<si32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    return %0 : tensor<4x4xf32>
+  }
+
+  // Case 9: tensor<ui32> → i64 (zero-extend across a signedness boundary).
+  //
+  // The caller wraps an unsigned 32-bit integer in a 0-D tensor.  The callee
+  // expects a bare signless i64.  Bridging must:
+  //   1. Extract the ui32 value from the 0-D tensor with tensor.extract.
+  //   2. Bitcast ui32 → i32 (arith ops require signless operands).
+  //   3. Zero-extend i32 → i64 with arith.extui (preserves the unsigned value).
+  // A warning is emitted about the signedness conversion.
+  //
+  // CHECK-LABEL: func.func @test_ui32_to_i64
+  // CHECK:         tensor.extract {{.*}}[] : tensor<ui32>
+  // CHECK:         builtin.unrealized_conversion_cast {{.*}} : ui32 to i32
+  // CHECK:         arith.extui {{.*}} : i32 to i64
+  // CHECK:         call @unsigned_ext_kernel
+  // CHECK:         tensor.cast {{.*}} : tensor<?x?xf32> to tensor<4x4xf32>
+  func.func @test_ui32_to_i64(%flag: tensor<ui32>,
+                               %mat: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %0 = "ttir.invoke_external"(%flag, %mat)
+         {path = "abi-bridging.mlir.ext", entry = "unsigned_ext_kernel"}
+         : (tensor<ui32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    return %0 : tensor<4x4xf32>
+  }
+
+  // Case 10: tensor<si64> → i32 (truncation from a signed type).
+  //
+  // The caller wraps a signed 64-bit integer in a 0-D tensor.  The callee
+  // expects a bare signless i32.  Bridging must:
+  //   1. Extract the si64 value from the 0-D tensor with tensor.extract.
+  //   2. Bitcast si64 → i64 (arith ops require signless operands).
+  //   3. Truncate i64 → i32 with arith.trunci (high bits are discarded).
+  // Warnings are emitted for both the truncation and the signedness conversion.
+  //
+  // CHECK-LABEL: func.func @test_si64_to_i32
+  // CHECK:         tensor.extract {{.*}}[] : tensor<si64>
+  // CHECK:         builtin.unrealized_conversion_cast {{.*}} : si64 to i64
+  // CHECK:         arith.trunci {{.*}} : i64 to i32
+  // CHECK:         call @truncated_kernel
+  // CHECK:         tensor.cast {{.*}} : tensor<?x?xf32> to tensor<4x4xf32>
+  func.func @test_si64_to_i32(%flag: tensor<si64>,
+                               %mat: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    %0 = "ttir.invoke_external"(%flag, %mat)
+         {path = "abi-bridging.mlir.ext", entry = "truncated_kernel"}
+         : (tensor<si64>, tensor<4x4xf32>) -> tensor<4x4xf32>
+    return %0 : tensor<4x4xf32>
   }
 }

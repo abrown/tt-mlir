@@ -2,11 +2,14 @@
 // extension suffix prevents llvm-lit from parsing it directly.
 //
 // Contains entry points used by abi-bridging.mlir:
-//   @dynamic_kernel  – expects dynamic-shaped tensors and bare scalars.
-//   @passthrough     – expects the exact same tensor type as the caller.
-//   @flagged_kernel  – expects a tensor<?x?xf32> and a bare i1 flag.
-//   @scale_kernel    – expects a bare f32 scalar and a tensor<?x?xf32>.
-//   @prefix_kernel   – expects a 2-D dynamic tensor<?x?xf16>.
+//   @dynamic_kernel      – expects dynamic-shaped tensors and bare scalars.
+//   @passthrough         – expects the exact same tensor type as the caller.
+//   @flagged_kernel      – expects a tensor<?x?xf32> and a bare i1 flag.
+//   @scale_kernel        – expects a bare f32 scalar and a tensor<?x?xf32>.
+//   @prefix_kernel       – expects a 2-D dynamic tensor<?x?xf16>.
+//   @signed_ext_kernel   – expects a bare i64 and a tensor<?x?xf32>.
+//   @unsigned_ext_kernel – expects a bare i64 and a tensor<?x?xf32>.
+//   @truncated_kernel    – expects a bare i32 and a tensor<?x?xf32>.
 
 module {
   // Entry point whose parameters differ from what the XLA caller provides:
@@ -35,5 +38,23 @@ module {
   // Entry point for Case 7: 2-D dynamic tensor (caller provides tensor<1x4x8xf16>).
   func.func @prefix_kernel(%mat: tensor<?x?xf16>) -> tensor<?x?xf16> {
     return %mat : tensor<?x?xf16>
+  }
+
+  // Entry point for Case 8: bare i64 (caller provides tensor<si32>).
+  // The callee is signless; bridging sign-extends from si32 → i32 → i64.
+  func.func @signed_ext_kernel(%n: i64, %mat: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
+  }
+
+  // Entry point for Case 9: bare i64 (caller provides tensor<ui32>).
+  // The callee is signless; bridging zero-extends from ui32 → i32 → i64.
+  func.func @unsigned_ext_kernel(%n: i64, %mat: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
+  }
+
+  // Entry point for Case 10: bare i32 (caller provides tensor<si64>).
+  // Bridging truncates from si64 → i64 → i32 (high bits discarded).
+  func.func @truncated_kernel(%n: i32, %mat: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
   }
 }

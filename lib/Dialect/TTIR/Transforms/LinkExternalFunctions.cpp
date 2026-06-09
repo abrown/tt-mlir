@@ -10,6 +10,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
@@ -179,9 +180,24 @@ static llvm::Expected<Value> adaptTensorToScalar(OpBuilder &builder,
   return builder.create<tensor::ExtractOp>(loc, caller, index).getResult();
 }
 
-// Truncates `caller` to `calleeType` via `arith.trunci` when both are integer
-// types and the caller is at least as wide. Returns `caller` unchanged when
-// the types already match. Returns an error if the coercion is not valid.
+// Adapts the width and signedness of integer `caller` to match `calleeType`.
+//
+// Width changes:
+//   - Truncation (caller wider):      arith.trunci  — high bits are discarded;
+//                                     a warning is emitted.
+//   - Extension, signed caller:       arith.extsi   — sign-extend.
+//   - Extension, unsigned caller:     arith.extui   — zero-extend.
+//   - Extension, signless caller:     arith.extsi   — conservative default.
+//
+// Same-width signedness change: arith.bitcast (no numeric change for the same
+// bit pattern, but a warning is emitted because the value may be reinterpreted
+// differently by the callee).
+//
+// arith width-change ops require signless integer operands; signed/unsigned
+// values are first bitcast to their signless equivalent and the result is
+// bitcast back to the callee's expected signedness.
+//
+// Returns an error if either type is not an IntegerType.
 static llvm::Expected<Value> adaptIntegerWidth(OpBuilder &builder, Location loc,
                                                Value caller, Type calleeType) {
   if (caller.getType() == calleeType) {
@@ -189,18 +205,75 @@ static llvm::Expected<Value> adaptIntegerWidth(OpBuilder &builder, Location loc,
   }
   auto callerInt = mlir::dyn_cast<IntegerType>(caller.getType());
   auto calleeInt = mlir::dyn_cast<IntegerType>(calleeType);
-  if (callerInt && calleeInt) {
-    if (callerInt.getWidth() > calleeInt.getWidth()) {
-      return builder.create<arith::TruncIOp>(loc, calleeType, caller)
-          .getResult();
-    } else {
-      return builder.create<arith::ExtSIOp>(loc, calleeType, caller)
-          .getResult();
-    }
-  } else {
+  if (!callerInt || !calleeInt) {
     return llvm::createStringError(llvm::formatv(
         "cannot coerce scalar type {0} to {1}", caller.getType(), calleeType));
   }
+
+  bool truncating = callerInt.getWidth() > calleeInt.getWidth();
+  bool signMismatch = callerInt.getSignedness() != calleeInt.getSignedness();
+
+  if (truncating) {
+    mlir::emitWarning(loc) << "ABI bridging: truncating integer from "
+                           << caller.getType() << " to " << calleeType
+                           << "; high bits will be discarded";
+  }
+  if (signMismatch) {
+    mlir::emitWarning(loc)
+        << "ABI bridging: converting integer signedness from "
+        << caller.getType() << " to " << calleeType
+        << "; the value may change if the sign bit is set";
+  }
+
+  MLIRContext *ctx = builder.getContext();
+
+  // arith.trunci/extsi/extui require signless integer operands.
+  // arith.bitcast also only accepts signless integers, so use
+  // unrealized_conversion_cast to strip any si*/ui* annotation before
+  // performing the width-change op.
+  Value signlessCallerVal = caller;
+  IntegerType signlessCallerType = IntegerType::get(ctx, callerInt.getWidth());
+  if (callerInt != signlessCallerType) {
+    signlessCallerVal =
+        builder
+            .create<UnrealizedConversionCastOp>(loc, signlessCallerType, caller)
+            .getResult(0);
+  }
+
+  // Perform the width change on the signless value, choosing the extension
+  // operation based on the caller's original signedness.
+  IntegerType signlessCalleeType = IntegerType::get(ctx, calleeInt.getWidth());
+  Value adapted;
+  if (callerInt.getWidth() == calleeInt.getWidth()) {
+    // Same width: signlessCallerVal already has the right bit width.
+    adapted = signlessCallerVal;
+  } else if (truncating) {
+    adapted =
+        builder
+            .create<arith::TruncIOp>(loc, signlessCalleeType, signlessCallerVal)
+            .getResult();
+  } else if (callerInt.isUnsigned()) {
+    // Zero-extend unsigned values to preserve their unsigned magnitude.
+    adapted =
+        builder
+            .create<arith::ExtUIOp>(loc, signlessCalleeType, signlessCallerVal)
+            .getResult();
+  } else {
+    // Sign-extend signed or signless values (conservative default).
+    adapted =
+        builder
+            .create<arith::ExtSIOp>(loc, signlessCalleeType, signlessCallerVal)
+            .getResult();
+  }
+
+  // Restore the callee's expected signedness if needed.
+  if (signlessCalleeType != calleeInt) {
+    adapted =
+        builder.create<UnrealizedConversionCastOp>(loc, calleeType, adapted)
+            .getResult(0);
+  }
+
+  return adapted;
 }
 
 // Collapses an initial empty dimension: `tensor<1x...>` → `tensor<...>` via
