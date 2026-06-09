@@ -189,11 +189,18 @@ static llvm::Expected<Value> adaptIntegerWidth(OpBuilder &builder, Location loc,
   }
   auto callerInt = mlir::dyn_cast<IntegerType>(caller.getType());
   auto calleeInt = mlir::dyn_cast<IntegerType>(calleeType);
-  if (!callerInt || !calleeInt || callerInt.getWidth() < calleeInt.getWidth()) {
+  if (callerInt && calleeInt) {
+    if (callerInt.getWidth() > calleeInt.getWidth()) {
+      return builder.create<arith::TruncIOp>(loc, calleeType, caller)
+          .getResult();
+    } else {
+      return builder.create<arith::ExtSIOp>(loc, calleeType, caller)
+          .getResult();
+    }
+  } else {
     return llvm::createStringError(llvm::formatv(
         "cannot coerce scalar type {0} to {1}", caller.getType(), calleeType));
   }
-  return builder.create<arith::TruncIOp>(loc, calleeType, caller).getResult();
 }
 
 // Collapses an initial empty dimension: `tensor<1x...>` → `tensor<...>` via
@@ -290,8 +297,8 @@ adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
 // `tensor<1x...>` via `tensor.expand_shape`. This is the reverse of
 // `collapseEmptyDimension`. Returns `callee` unchanged if the caller type does
 // not require an initial empty dimension.
-static Value expandEmptyDimension(OpBuilder &builder, Location loc, Value callee,
-                               RankedTensorType callerType) {
+static Value expandEmptyDimension(OpBuilder &builder, Location loc,
+                                  Value callee, RankedTensorType callerType) {
   if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
     auto calleeType = cast<RankedTensorType>(callee.getType());
     assert(callerType.getRank() == calleeType.getRank() + 1 &&
@@ -338,9 +345,9 @@ static SmallVector<Value> adaptOutputsToLinkAbi(OpBuilder &builder,
     if (callResult.getType() != invokeResultType) {
       Value result = callResult;
       if (isa<RankedTensorType>(invokeResultType)) {
-        result =
-            expandEmptyDimension(builder, loc, result,
-                              mlir::cast<RankedTensorType>(invokeResultType));
+        result = expandEmptyDimension(
+            builder, loc, result,
+            mlir::cast<RankedTensorType>(invokeResultType));
       }
       adaptedResults.push_back(
           builder.create<tensor::CastOp>(loc, invokeResultType, result));
