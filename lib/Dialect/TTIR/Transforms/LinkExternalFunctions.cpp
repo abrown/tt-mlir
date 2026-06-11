@@ -276,31 +276,6 @@ static llvm::Expected<Value> adaptIntegerWidth(OpBuilder &builder, Location loc,
   return adapted;
 }
 
-// Collapses an initial empty dimension: `tensor<1x...>` → `tensor<...>` via
-// `tensor.collapse_shape`. Returns `caller` unchanged if the caller type does
-// not have an initial empty dimension.
-static Value pruneEmptyDimension(OpBuilder &builder, Location loc, Value caller,
-                                 Type calleeType) {
-  auto callerType = mlir::cast<RankedTensorType>(caller.getType());
-  if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
-    assert(mlir::cast<RankedTensorType>(calleeType).getRank() ==
-               callerType.getRank() - 1 &&
-           "callee must have exactly one less dimension than caller");
-    auto collapsedShape = llvm::ArrayRef<int64_t>(
-        callerType.getShape().begin() + 1, callerType.getShape().end());
-    auto collapsedTy =
-        RankedTensorType::get(collapsedShape, callerType.getElementType());
-    auto reassoc = SmallVector<ReassociationIndices>{{0, 1}};
-    for (int64_t i = 2; i <= collapsedTy.getRank(); ++i) {
-      reassoc.push_back({i});
-    }
-    return builder.create<tensor::CollapseShapeOp>(loc, collapsedTy, caller,
-                                                   reassoc);
-  } else {
-    return caller;
-  }
-}
-
 // Adapts the arguments of a `ttir.invoke_external` op to match the callee
 // function parameter types:
 //
@@ -348,8 +323,18 @@ adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
     } else if (isa<RankedTensorType>(calleeParamType) &&
                isa<RankedTensorType>(callerArgType) &&
                callerArgType != calleeParamType) {
-      // Case: tensor<1xT> → tensor<?>.
-      callerArg = pruneEmptyDimension(builder, loc, callerArg, calleeParamType);
+      // Cast the caller type to the callee type to bridge the difference in
+      // layout, e.g.:
+      // - caller/graph: tensor<64x1xf32, #ttnn.ttnn_layout<(d0, d1) -> (d0,
+      //   d1), <1x1>, memref<2x1x!ttcore.tile<32x32, f32>,
+      //   #ttnn.buffer_type<dram>>, <interleaved>>>
+      // - callee/kernel: tensor<?x?xf32, #ttnn.ttnn_layout<(d0, d1) -> (d0,
+      //   d1), <1x1>, memref<1x1x!ttcore.tile<32x32, f32>,
+      //   #ttnn.buffer_type<dram>>, <interleaved>>>
+      //
+      // We expect that tensor<64x1xf32> is a subtype of tensor<?x?xf32> and
+      // will work just fine, but the ttnn_layout encodings must match. The
+      // graph-side layout is propagated later by the PropagateLinkLayout pass.
       adaptedArgs.push_back(
           builder.create<tensor::CastOp>(loc, calleeParamType, callerArg));
     } else if (callerArgType != calleeParamType) {

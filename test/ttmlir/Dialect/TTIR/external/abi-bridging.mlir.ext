@@ -6,7 +6,6 @@
 //   @passthrough         – expects the exact same tensor type as the caller.
 //   @flagged_kernel      – expects a tensor<?x?xf32> and a bare i1 flag.
 //   @scale_kernel        – expects a bare f32 scalar and a tensor<?x?xf32>.
-//   @prefix_kernel       – expects a 2-D dynamic tensor<?x?xf16>.
 //   @signed_ext_kernel   – expects a bare i64 and a tensor<?x?xf32>.
 //   @unsigned_ext_kernel – expects a bare i64 and a tensor<?x?xf32>.
 //   @truncated_kernel    – expects a bare i32 and a tensor<?x?xf32>.
@@ -33,11 +32,6 @@ module {
   // Entry point for Case 6: bare f32 scalar (caller provides tensor<1xf32>).
   func.func @scale_kernel(%scale: f32, %mat: tensor<?x?xf32>) -> tensor<?x?xf32> {
     return %mat : tensor<?x?xf32>
-  }
-
-  // Entry point for Case 7: 2-D dynamic tensor (caller provides tensor<1x4x8xf16>).
-  func.func @prefix_kernel(%mat: tensor<?x?xf16>) -> tensor<?x?xf16> {
-    return %mat : tensor<?x?xf16>
   }
 
   // Entry point for Case 8: bare i64 (caller provides tensor<si32>).

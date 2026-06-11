@@ -20,6 +20,8 @@ add_mlir_dialect_library(MLIRTTNNTransforms
         TTNNAllocateDistributedOpSemaphores.cpp
         TTNNCollaspeD2M.cpp
         TTNNCollectPerfMetrics.cpp
+        TTNNInlineLinkedKernels.cpp
+        TTNNPropagateLinkLayout.cpp
         TTNNCreateD2MSubgraphs.cpp
         TTNNFileSplit.cpp
         TTNNPrepareConstEvalCaching.cpp

@@ -10,7 +10,6 @@
 //   Case 4 (pass-through):         exact type match      → no bridging ops
 //   Case 5 (extract + trunci):     0-D wide-int tensor   → narrow scalar (i1)
 //   Case 6 (1D extract):           tensor<1xT>           → bare scalar T
-//   Case 7 (collapse + expand):    tensor<1x…> input/result → dynamic 2D
 //   Case 8 (extract + bitcast + extsi):  tensor<si32> → i64 (signed ext)
 //   Case 9 (extract + bitcast + extui):  tensor<ui32> → i64 (unsigned ext)
 //   Case 10 (extract + bitcast + trunci): tensor<si64> → i32 (truncation)
@@ -91,28 +90,6 @@ module {
          {path = "abi-bridging.mlir.ext", entry = "scale_kernel"}
          : (tensor<1xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
     return %0 : tensor<4x4xf32>
-  }
-
-  // Case 7: tensor<1x4x8xf16> input/result ↔ tensor<?x?xf16> callee.
-  //
-  // The caller holds a 3-D tensor with a leading size-1 batch dimension.  The
-  // callee operates on 2-D dynamic tensors.  The bridging must:
-  //   input:  tensor.collapse_shape to drop the leading 1 → tensor<4x8xf16>,
-  //           then tensor.cast to tensor<?x?xf16>.
-  //   result: tensor.expand_shape to re-insert the leading 1 dimension,
-  //           then tensor.cast back to tensor<1x4x8xf16>.
-  //
-  // CHECK-LABEL: func.func @test_1x_prefix
-  // CHECK:         tensor.collapse_shape {{.*}} : tensor<1x4x8xf16> into tensor<4x8xf16>
-  // CHECK:         tensor.cast {{.*}} : tensor<4x8xf16> to tensor<?x?xf16>
-  // CHECK:         call @prefix_kernel
-  // CHECK:         tensor.expand_shape {{.*}} : tensor<?x?xf16> into tensor<1x?x?xf16>
-  // CHECK:         tensor.cast {{.*}} : tensor<1x?x?xf16> to tensor<1x4x8xf16>
-  func.func @test_1x_prefix(%mat: tensor<1x4x8xf16>) -> tensor<1x4x8xf16> {
-    %0 = "ttir.invoke_external"(%mat)
-         {path = "abi-bridging.mlir.ext", entry = "prefix_kernel"}
-         : (tensor<1x4x8xf16>) -> tensor<1x4x8xf16>
-    return %0 : tensor<1x4x8xf16>
   }
 
   // Case 8: tensor<si32> → i64 (sign-extend across a signedness boundary).
