@@ -355,27 +355,27 @@ adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
 // `tensor<1x...>` via `tensor.expand_shape`. This is the reverse of
 // `collapseEmptyDimension`. Returns `callee` unchanged if the caller type does
 // not require an initial empty dimension.
-static Value expandEmptyDimension(OpBuilder &builder, Location loc,
-                                  Value callee, RankedTensorType callerType) {
-  if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
-    auto calleeType = cast<RankedTensorType>(callee.getType());
-    assert(callerType.getRank() == calleeType.getRank() + 1 &&
-           "callee must have exactly one less dimension than caller");
-    SmallVector<int64_t> expandedShape = {1};
-    expandedShape.append(calleeType.getShape().begin(),
-                         calleeType.getShape().end());
-    auto expandedTy =
-        RankedTensorType::get(expandedShape, callerType.getElementType());
-    auto reassoc = SmallVector<ReassociationIndices>{{0, 1}};
-    for (int64_t i = 2; i <= calleeType.getRank(); ++i) {
-      reassoc.push_back({i});
-    }
-    return builder.create<tensor::ExpandShapeOp>(loc, expandedTy, callee,
-                                                 reassoc);
-  } else {
-    return callee;
-  }
-}
+// static Value expandEmptyDimension(OpBuilder &builder, Location loc,
+//                                   Value callee, RankedTensorType callerType) {
+//   if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
+//     auto calleeType = cast<RankedTensorType>(callee.getType());
+//     assert(callerType.getRank() == calleeType.getRank() + 1 &&
+//            "callee must have exactly one less dimension than caller");
+//     SmallVector<int64_t> expandedShape = {1};
+//     expandedShape.append(calleeType.getShape().begin(),
+//                          calleeType.getShape().end());
+//     auto expandedTy =
+//         RankedTensorType::get(expandedShape, callerType.getElementType());
+//     auto reassoc = SmallVector<ReassociationIndices>{{0, 1}};
+//     for (int64_t i = 2; i <= calleeType.getRank(); ++i) {
+//       reassoc.push_back({i});
+//     }
+//     return builder.create<tensor::ExpandShapeOp>(loc, expandedTy, callee,
+//                                                  reassoc);
+//   } else {
+//     return callee;
+//   }
+// }
 
 // Adapts the results of a `func.call` back to the types declared on the
 // originating `ttir.invoke_external` op. This is the reverse of
@@ -400,15 +400,58 @@ static SmallVector<Value> adaptOutputsToLinkAbi(OpBuilder &builder,
 
   for (auto [callResult, invokeResultType] :
        llvm::zip(callOp.getResults(), invokeOp.getResultTypes())) {
-    if (callResult.getType() != invokeResultType) {
-      Value result = callResult;
-      if (isa<RankedTensorType>(invokeResultType)) {
-        result = expandEmptyDimension(
-            builder, loc, result,
-            mlir::cast<RankedTensorType>(invokeResultType));
-      }
+    if (callResult.getType() == invokeResultType) {
+      // Case: types already match — pass through unchanged.
+      adaptedResults.push_back(callResult);
+    } else if (tensor::CastOp::areCastCompatible(callResult.getType(),
+                                                 invokeResultType)) {
+      // Case: same rank, compatible types — bridge with tensor.cast.
       adaptedResults.push_back(
-          builder.create<tensor::CastOp>(loc, invokeResultType, result));
+          builder.create<tensor::CastOp>(loc, invokeResultType, callResult));
+    } else if (isa<RankedTensorType>(callResult.getType()) &&
+               isa<RankedTensorType>(invokeResultType)) {
+      auto callType = cast<RankedTensorType>(callResult.getType());
+      auto invokeType = cast<RankedTensorType>(invokeResultType);
+
+      // Case: kernel output rank is one less than the invoke result rank, and
+      // the invoke result has a leading dimension of 1. For example:
+      //   kernel output: tensor<?x?xf32>  (2-D dynamic)
+      //   invoke result: tensor<1x64x18xf32>  (3-D static)
+      //
+      // Bridge with:
+      //   1. tensor.cast  — dynamic 2-D → static 2-D (same encoding, shape only)
+      //   2. ttir.reshape — static 2-D → 3-D (adds the leading-1 dimension)
+      if (callType.getRank() + 1 == invokeType.getRank() &&
+          invokeType.getDimSize(0) == 1) {
+        // Build the intermediate static 2-D type. Using the kernel encoding
+        // ensures that tensor.cast is legal (only the shape changes).
+        SmallVector<int64_t> shape2D(invokeType.getShape().begin() + 1,
+                                     invokeType.getShape().end());
+        auto intermediate2DType = RankedTensorType::get(
+            shape2D, callType.getElementType(), callType.getEncoding());
+
+        // Step 1: tensor.cast — dynamic 2-D → static 2-D.
+        Value toReshape = callResult;
+        if (callResult.getType() != intermediate2DType &&
+            tensor::CastOp::areCastCompatible(callResult.getType(),
+                                              intermediate2DType)) {
+          toReshape = builder.create<tensor::CastOp>(loc, intermediate2DType,
+                                                     callResult);
+        }
+
+        // Step 2: ttir.reshape — static 2-D → 3-D (invokeResultType).
+        SmallVector<int32_t> shapeAttr;
+        for (int64_t d : invokeType.getShape()) {
+          shapeAttr.push_back(static_cast<int32_t>(d));
+        }
+        adaptedResults.push_back(builder.create<ttir::ReshapeOp>(
+            loc, invokeResultType, toReshape,
+            builder.getI32ArrayAttr(shapeAttr)));
+      } else {
+        // Unhandled rank mismatch — pass through and let downstream
+        // verification report the problem.
+        adaptedResults.push_back(callResult);
+      }
     } else {
       adaptedResults.push_back(callResult);
     }

@@ -194,11 +194,17 @@ void createTTNNPipelineLoweringPasses(OpPassManager &pm,
   // `ttnn.generic`), so unrelated `func.call`s are left untouched.
   pm.addPass(createTTNNInlineLinkedKernels());
 
+  // Canonicalize to fold link-ABI bridging cast chains (e.g.
+  // `concrete -> dynamic -> static`) into a single encoding-only cast before
+  // the layout propagation pass sees them.  This is intentionally placed
+  // BEFORE TTNNPropagateLinkLayout so that Phase 2's encoding-only folding
+  // rule can eliminate the simplified cast without a subsequent canonicalize
+  // step causing constant-folding of the DPS output buffer.
+  pm.addPass(mlir::createCanonicalizerPass());
+
   // Lower the link-ABI `tensor.cast` ops by propagating the caller's static
   // shape and `ttnn_layout` into the inlined `ttnn.generic` operands.
   pm.addPass(createTTNNPropagateLinkLayout());
-  // Canonicalize to clean up any residual casts.
-  pm.addPass(mlir::createCanonicalizerPass());
 
   // Add pass to convert TTIR to TTNN.
   pm.addPass(createConvertTTIRToTTNNPass());

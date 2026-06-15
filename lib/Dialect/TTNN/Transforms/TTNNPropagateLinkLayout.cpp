@@ -18,12 +18,21 @@ namespace mlir::tt::ttnn {
 namespace {
 
 // Returns true if `castOp` is a layout/shape bridging cast inserted by the
-// link-external-functions ABI: both source and result are ranked tensors with
-// the same element type, but their types differ in `ttnn_layout` encoding).
+// link-external-functions ABI: both source and result are ranked tensors of the
+// same rank and element type, but their shapes or `ttnn_layout` encodings differ.
+//
+// We intentionally do NOT use `tensor::canFoldIntoConsumerOp` here because that
+// helper calls `preservesStaticInformation`, which returns false when the TTNN
+// layout encodings differ (e.g., concrete memref tile sizes vs. dynamic tile
+// sizes). All link-ABI bridging casts have matching rank and element type, so
+// checking those two properties is sufficient to identify them.
 static bool isLinkBridgingCast(tensor::CastOp castOp) {
   auto srcType = llvm::dyn_cast<RankedTensorType>(castOp.getSource().getType());
   auto resType = llvm::dyn_cast<RankedTensorType>(castOp.getResult().getType());
-  return mlir::tensor::canFoldIntoConsumerOp(castOp) && srcType != resType;
+  return srcType && resType &&
+         srcType.getRank() == resType.getRank() &&
+         srcType.getElementType() == resType.getElementType() &&
+         srcType != resType;
 }
 
 class TTNNPropagateLinkLayout
@@ -91,6 +100,13 @@ public:
             continue;
           }
         }
+        // Note: encoding-only casts (same shape and element type, different
+        // TTNN layout encoding) are left in place here. They serve as
+        // data-flow fences that prevent downstream constant-folding passes from
+        // treating the DPS output buffer as a compile-time constant. These
+        // casts are handled by a dedicated conversion pattern in
+        // ConvertTTIRToTTNN, which replaces them with a `ttnn.reshape` of the
+        // same shape — a no-op at runtime that is opaque to constant folding.
       }
     }
   }
