@@ -351,32 +351,6 @@ adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
   return adaptedArgs;
 }
 
-// Expands the first dimension to an initial empty dimension: `tensor<...>` →
-// `tensor<1x...>` via `tensor.expand_shape`. This is the reverse of
-// `collapseEmptyDimension`. Returns `callee` unchanged if the caller type does
-// not require an initial empty dimension.
-// static Value expandEmptyDimension(OpBuilder &builder, Location loc,
-//                                   Value callee, RankedTensorType callerType) {
-//   if (callerType.getRank() > 0 && callerType.getShape()[0] == 1) {
-//     auto calleeType = cast<RankedTensorType>(callee.getType());
-//     assert(callerType.getRank() == calleeType.getRank() + 1 &&
-//            "callee must have exactly one less dimension than caller");
-//     SmallVector<int64_t> expandedShape = {1};
-//     expandedShape.append(calleeType.getShape().begin(),
-//                          calleeType.getShape().end());
-//     auto expandedTy =
-//         RankedTensorType::get(expandedShape, callerType.getElementType());
-//     auto reassoc = SmallVector<ReassociationIndices>{{0, 1}};
-//     for (int64_t i = 2; i <= calleeType.getRank(); ++i) {
-//       reassoc.push_back({i});
-//     }
-//     return builder.create<tensor::ExpandShapeOp>(loc, expandedTy, callee,
-//                                                  reassoc);
-//   } else {
-//     return callee;
-//   }
-// }
-
 // Adapts the results of a `func.call` back to the types declared on the
 // originating `ttir.invoke_external` op. This is the reverse of
 // `adaptInputsToLinkAbi` for return values:
