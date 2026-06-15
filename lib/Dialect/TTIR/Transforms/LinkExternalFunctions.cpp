@@ -158,135 +158,11 @@ mergeExternalModule(ModuleOp destModule,
   return renameMap;
 }
 
-// Extracts a scalar value from a 0-D or 1-D single-element ranked tensor
-// using `tensor.extract`. Returns an error if the tensor does not have
-// exactly one element.
-static llvm::Expected<Value> adaptTensorToScalar(OpBuilder &builder,
-                                                 Location loc, Value caller) {
-  assert(mlir::isa<RankedTensorType>(caller.getType()) &&
-         "expected caller to provide a ranked tensor for scalar argument");
-  auto ty = mlir::cast<RankedTensorType>(caller.getType());
-  if (ty.getNumElements() != 1) {
-    return llvm::createStringError(llvm::formatv(
-        "expected 0-D or 1-D ranked tensor for scalar argument: found {0}",
-        caller.getType()));
-  }
-  auto index = ValueRange{};
-  // A `tensor<1xT>` requires an index; `tensor<T>` does not.
-  if (ty.getRank() == 1) {
-    auto zero = builder.create<arith::ConstantIndexOp>(loc, 0);
-    index = ValueRange{zero};
-  }
-  return builder.create<tensor::ExtractOp>(loc, caller, index).getResult();
-}
-
-// Adapts the width and signedness of integer `caller` to match `calleeType`.
-//
-// Width changes:
-//   - Truncation (caller wider):      arith.trunci  — high bits are discarded;
-//                                     a warning is emitted.
-//   - Extension, signed caller:       arith.extsi   — sign-extend.
-//   - Extension, unsigned caller:     arith.extui   — zero-extend.
-//   - Extension, signless caller:     arith.extsi   — conservative default.
-//
-// Same-width signedness change: arith.bitcast (no numeric change for the same
-// bit pattern, but a warning is emitted because the value may be reinterpreted
-// differently by the callee).
-//
-// arith width-change ops require signless integer operands; signed/unsigned
-// values are first bitcast to their signless equivalent and the result is
-// bitcast back to the callee's expected signedness.
-//
-// Returns an error if either type is not an IntegerType.
-static llvm::Expected<Value> adaptIntegerWidth(OpBuilder &builder, Location loc,
-                                               Value caller, Type calleeType) {
-  if (caller.getType() == calleeType) {
-    return caller;
-  }
-  auto callerInt = mlir::dyn_cast<IntegerType>(caller.getType());
-  auto calleeInt = mlir::dyn_cast<IntegerType>(calleeType);
-  if (!callerInt || !calleeInt) {
-    return llvm::createStringError(llvm::formatv(
-        "cannot coerce scalar type {0} to {1}", caller.getType(), calleeType));
-  }
-
-  bool truncating = callerInt.getWidth() > calleeInt.getWidth();
-  bool signMismatch = callerInt.getSignedness() != calleeInt.getSignedness();
-
-  if (truncating) {
-    mlir::emitWarning(loc) << "ABI bridging: truncating integer from "
-                           << caller.getType() << " to " << calleeType
-                           << "; high bits will be discarded";
-  }
-  if (signMismatch) {
-    mlir::emitWarning(loc)
-        << "ABI bridging: converting integer signedness from "
-        << caller.getType() << " to " << calleeType
-        << "; the value may change if the sign bit is set";
-  }
-
-  MLIRContext *ctx = builder.getContext();
-
-  // arith.trunci/extsi/extui require signless integer operands.
-  // arith.bitcast also only accepts signless integers, so use
-  // unrealized_conversion_cast to strip any si*/ui* annotation before
-  // performing the width-change op.
-  Value signlessCallerVal = caller;
-  IntegerType signlessCallerType = IntegerType::get(ctx, callerInt.getWidth());
-  if (callerInt != signlessCallerType) {
-    signlessCallerVal =
-        builder
-            .create<UnrealizedConversionCastOp>(loc, signlessCallerType, caller)
-            .getResult(0);
-  }
-
-  // Perform the width change on the signless value, choosing the extension
-  // operation based on the caller's original signedness.
-  IntegerType signlessCalleeType = IntegerType::get(ctx, calleeInt.getWidth());
-  Value adapted;
-  if (callerInt.getWidth() == calleeInt.getWidth()) {
-    // Same width: signlessCallerVal already has the right bit width.
-    adapted = signlessCallerVal;
-  } else if (truncating) {
-    adapted =
-        builder
-            .create<arith::TruncIOp>(loc, signlessCalleeType, signlessCallerVal)
-            .getResult();
-  } else if (callerInt.isUnsigned()) {
-    // Zero-extend unsigned values to preserve their unsigned magnitude.
-    adapted =
-        builder
-            .create<arith::ExtUIOp>(loc, signlessCalleeType, signlessCallerVal)
-            .getResult();
-  } else {
-    // Sign-extend signed or signless values (conservative default).
-    adapted =
-        builder
-            .create<arith::ExtSIOp>(loc, signlessCalleeType, signlessCallerVal)
-            .getResult();
-  }
-
-  // Restore the callee's expected signedness if needed.
-  if (signlessCalleeType != calleeInt) {
-    adapted =
-        builder.create<UnrealizedConversionCastOp>(loc, calleeType, adapted)
-            .getResult(0);
-  }
-
-  return adapted;
-}
-
 // Adapts the arguments of a `ttir.invoke_external` op to match the callee
 // function parameter types:
 //
 //   - Tensors with concrete static shapes where the callee expects dynamic
 //     shapes (or a different encoding). These are bridged with `tensor.cast`.
-//   - Tensors with an initial empty dimension where the callee expects no such
-//     dimension. The empty dimension is pruned with `tensor.collapse_shape`.
-//   - 0-D or 1-D ranked tensors where the callee expects a bare scalar type.
-//     These are unwrapped with `tensor.extract`.
-//   - Wider integer types where the callee expects narrower integer types.
-//     These are coerced with `arith.trunci`.
 //
 // Returns the adapted argument values, or failure if arity does not match.
 static FailureOr<SmallVector<Value>>
@@ -307,22 +183,9 @@ adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
   for (auto [callerArg, calleeParamType] :
        llvm::zip(invokeOp.getArguments(), calleeFunc.getArgumentTypes())) {
     Type callerArgType = callerArg.getType();
-    if (!isa<RankedTensorType>(calleeParamType) &&
-        isa<RankedTensorType>(callerArgType)) {
-      // Case: tensor → scalar.
-      auto scalar = adaptTensorToScalar(builder, loc, callerArg);
-      if (!scalar) {
-        return invokeOp.emitOpError() << llvm::toString(scalar.takeError());
-      }
-      // Case: wider int → narrower int.
-      auto coerced = adaptIntegerWidth(builder, loc, *scalar, calleeParamType);
-      if (!coerced) {
-        return invokeOp.emitOpError() << llvm::toString(coerced.takeError());
-      }
-      adaptedArgs.push_back(*coerced);
-    } else if (isa<RankedTensorType>(calleeParamType) &&
-               isa<RankedTensorType>(callerArgType) &&
-               callerArgType != calleeParamType) {
+    if (isa<RankedTensorType>(calleeParamType) &&
+        isa<RankedTensorType>(callerArgType) &&
+        callerArgType != calleeParamType) {
       // Cast the caller type to the callee type to bridge the difference in
       // layout, e.g.:
       // - caller/graph: tensor<64x1xf32, #ttnn.ttnn_layout<(d0, d1) -> (d0,
@@ -352,17 +215,14 @@ adaptInputsToLinkAbi(OpBuilder &builder, ttir::InvokeExternalOp invokeOp,
 }
 
 // Adapts the results of a `func.call` back to the types declared on the
-// originating `ttir.invoke_external` op. This is the reverse of
-// `adaptInputsToLinkAbi` for return values:
+// originating `ttir.invoke_external` op.  The callee may return dynamic-shaped
+// tensors while the surrounding IR expects the concrete shapes declared on the
+// invoke op. This is the reverse of `adaptInputsToLinkAbi` for return values:
 //
 //   - Tensors with dynamic static shapes where the caller expects static
 //     shapes. These are bridged with `tensor.cast`.
 //   - Tensors where the caller expects an initial empty dimension. The empty
-//     dimension is added with `tensor.expand_shape`.
-//
-// The callee may return dynamic-shaped tensors while the surrounding IR
-// expects the concrete shapes declared on the invoke op. `tensor.cast` is
-// inserted where the types differ.
+//     dimension is added with `ttir.reshape`.
 //
 // Returns the adapted result values.
 static SmallVector<Value> adaptOutputsToLinkAbi(OpBuilder &builder,
@@ -393,7 +253,8 @@ static SmallVector<Value> adaptOutputsToLinkAbi(OpBuilder &builder,
       //   invoke result: tensor<1x64x18xf32>  (3-D static)
       //
       // Bridge with:
-      //   1. tensor.cast  — dynamic 2-D → static 2-D (same encoding, shape only)
+      //   1. tensor.cast  — dynamic 2-D → static 2-D (same encoding, shape
+      //   only)
       //   2. ttir.reshape — static 2-D → 3-D (adds the leading-1 dimension)
       if (callType.getRank() + 1 == invokeType.getRank() &&
           invokeType.getDimSize(0) == 1) {
@@ -513,8 +374,7 @@ struct TTIRLinkExternalFunctionsPass
       //   `tensor.cast` from/to the concrete static shapes given to
       //   `ttir.invoke_external`.
       // - we expect scalars in the callee to be wrapped by 0D tensors
-      //   (`tensor<f32>`); prior to the `func.call`, we `tensor.extract`
-      //   them.
+      //   (`tensor<f32>`); prior to the `func.call`, we pass them through.
       OpBuilder builder(invokeOp);
       auto adaptedArgsOrErr =
           adaptInputsToLinkAbi(builder, invokeOp, calleeFunc);
