@@ -1,0 +1,19 @@
+// This file is meant to be injected via `ttir.invoke_external`; the `.ext`
+// extension suffix prevents llvm-lit from parsing it directly.
+//
+// Contains entry points used by abi-bridging.mlir:
+//   @dynamic_kernel      – expects dynamic-shaped tensors.
+//   @passthrough         – expects the exact same tensor type as the caller.
+
+module {
+  // Entry point whose tensor arguments use dynamic shapes instead of static.
+  func.func @dynamic_kernel(%mat: tensor<?x?xf32>) -> tensor<?x?xf32> {
+    return %mat : tensor<?x?xf32>
+  }
+
+  // Entry point whose parameter and result types exactly match the caller;
+  // no bridging ops should be emitted.
+  func.func @passthrough(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+    return %arg0 : tensor<4x4xf32>
+  }
+}

@@ -56,6 +56,8 @@ add_mlir_dialect_library(MLIRTTNNTransforms
         TTNNCollaspeD2M.cpp
         TTNNResolveComposites.cpp
         TTNNCollectPerfMetrics.cpp
+        TTNNInlineLinkedKernels.cpp
+        TTNNPropagateLinkLayout.cpp
         TTNNCreateD2MSubgraphs.cpp
         TTNNFileSplit.cpp
         TTNNPrepareConstEvalCaching.cpp

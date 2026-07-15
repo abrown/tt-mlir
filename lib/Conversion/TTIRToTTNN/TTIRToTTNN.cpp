@@ -34,8 +34,52 @@
 #include <cstdint>
 #include <optional>
 
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+
 using namespace mlir;
 using namespace mlir::tt;
+
+namespace {
+// Converts an encoding-only `tensor.cast` (same shape and element type, but
+// different TTNN layout encodings) that arises from the link-external-functions
+// output-bridging ABI into a `ttnn.reshape` of the same shape.
+//
+// The cast acts as a data-flow fence preventing constant-folding passes from
+// treating the DPS output buffer as a compile-time constant.  After this
+// conversion the resulting same-shape `ttnn.reshape` is immediately folded by
+// `foldConsecutiveReshape` with the subsequent shape-changing `ttnn.reshape`,
+// collapsing the chain to a single `ttnn.reshape` that is opaque to
+// constant-folding in the TTNN dialect.
+class EncodingCastConversionPattern
+    : public OpConversionPattern<tensor::CastOp> {
+public:
+  using OpConversionPattern<tensor::CastOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(tensor::CastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto srcType =
+        llvm::dyn_cast<RankedTensorType>(adaptor.getSource().getType());
+    auto resType =
+        llvm::dyn_cast<RankedTensorType>(this->getTypeConverter()->convertType(
+            op.getResult().getType()));
+    if (!srcType || !resType ||
+        srcType.getShape() != resType.getShape() ||
+        srcType.getElementType() != resType.getElementType()) {
+      return rewriter.notifyMatchFailure(
+          op, "not an encoding-only cast (shape or element type differs)");
+    }
+    SmallVector<int32_t> shapeAttr;
+    for (int64_t d : resType.getShape()) {
+      shapeAttr.push_back(static_cast<int32_t>(d));
+    }
+    rewriter.replaceOpWithNewOp<ttnn::ReshapeOp>(
+        op, resType, adaptor.getSource(),
+        rewriter.getI32ArrayAttr(shapeAttr));
+    return success();
+  }
+};
+} // namespace
 
 namespace {
 class TensorEmptyConversionPattern : public OpConversionPattern<ttir::EmptyOp> {
@@ -3557,7 +3601,8 @@ void populateTTIRToTTNNPatterns(MLIRContext *ctx, RewritePatternSet &patterns,
   // clang-format off
   // ANCHOR: op_rewriter_pattern_set
   patterns
-      .add<TensorEmptyConversionPattern,
+      .add<EncodingCastConversionPattern,
+           TensorEmptyConversionPattern,
            NamedFullConversionPattern<ttir::ZerosOp, ttnn::ZerosOp>,
            NamedFullConversionPattern<ttir::OnesOp, ttnn::OnesOp>,
            FullOpConversionPattern,
