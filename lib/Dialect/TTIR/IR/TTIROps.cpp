@@ -8657,6 +8657,38 @@ static bool anyZero(mlir::ElementsAttr elems) {
 }
 
 //===----------------------------------------------------------------------===//
+// InvokeExternalOp
+//===----------------------------------------------------------------------===//
+
+::mlir::LogicalResult mlir::tt::ttir::InvokeExternalOp::verify() {
+  if (getPath().empty()) {
+    return emitOpError("'path' attribute must not be empty");
+  }
+
+  if (getEntry().empty()) {
+    return emitOpError("'entry' attribute must not be empty");
+  }
+
+  for (auto in : getArguments()) {
+    if (auto rt = ::mlir::dyn_cast<RankedTensorType>(in.getType())) {
+      if (!rt.hasStaticShape()) {
+        return emitOpError("argument type '")
+               << rt << "' must have a static shape";
+      }
+    }
+  }
+
+  for (auto out : getResults()) {
+    auto rt = ::mlir::cast<RankedTensorType>(out.getType());
+    if (!rt.hasStaticShape()) {
+      return emitOpError("result type '") << rt << "' must have a static shape";
+    }
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // TTLangOp
 //===----------------------------------------------------------------------===//
 
