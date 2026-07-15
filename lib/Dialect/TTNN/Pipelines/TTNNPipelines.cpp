@@ -188,6 +188,24 @@ void createTTNNPipelineLoweringPasses(OpPassManager &pm,
   // before converting TTIR to TTNN so that the resulting `func.call` ops are
   // legal in the TTNN conversion pass.
   pm.addPass(mlir::tt::ttir::createTTIRLinkExternalFunctions());
+
+  // Inline the just-linked external kernels into their callers. This is
+  // restricted to injected kernels (callees whose body contains a
+  // `ttnn.generic`), so unrelated `func.call`s are left untouched.
+  pm.addPass(createTTNNInlineLinkedKernels());
+
+  // Canonicalize to fold link-ABI bridging cast chains (e.g.
+  // `concrete -> dynamic -> static`) into a single encoding-only cast before
+  // the layout propagation pass sees them.  This is intentionally placed
+  // BEFORE TTNNPropagateLinkLayout so that Phase 2's encoding-only folding
+  // rule can eliminate the simplified cast without a subsequent canonicalize
+  // step causing constant-folding of the DPS output buffer.
+  pm.addPass(mlir::createCanonicalizerPass());
+
+  // Lower the link-ABI `tensor.cast` ops by propagating the caller's static
+  // shape and `ttnn_layout` into the inlined `ttnn.generic` operands.
+  pm.addPass(createTTNNPropagateLinkLayout());
+
   // Add pass to convert TTIR to TTNN.
   pm.addPass(createConvertTTIRToTTNNPass());
   // Add pass to remove unused values.

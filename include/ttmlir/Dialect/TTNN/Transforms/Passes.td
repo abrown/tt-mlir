@@ -700,6 +700,44 @@ def TTNNCollaspeD2M : Pass<"ttnn-collaspe-d2m", "::mlir::ModuleOp"> {
   }];
 }
 
+def TTNNInlineLinkedKernels
+    : Pass<"ttnn-inline-linked-kernels", "::mlir::ModuleOp"> {
+  let summary = "Inline external kernels linked via `ttir.invoke_external`.";
+  let description = [{
+    Inlines the `func.call`s produced by `ttir-link-external-functions` into
+    their callers. To avoid touching unrelated calls, this pass is restricted to
+    callees that are recognized as injected kernels, i.e. functions whose body
+    contains a `ttnn.generic` op. The inlined call site retains the link-ABI
+    `tensor.cast` ops; these are subsequently lowered by
+    `ttnn-propagate-link-layout`.
+
+    The now-dead kernel entry function is erased. Helper kernel functions
+    referenced by the `ttnn.generic` program attribute (via symbol references,
+    not `func.call`) are retained.
+  }];
+}
+
+def TTNNPropagateLinkLayout
+    : Pass<"ttnn-propagate-link-layout", "::mlir::ModuleOp"> {
+  let summary = "Propagate graph tensor layouts through link-ABI casts.";
+  let description = [{
+    When an external kernel is linked in via `ttir.invoke_external` and inlined,
+    the caller (graph) values are bridged to the kernel's parameter types with
+    `tensor.cast` ops. The kernel is compiled without knowledge of the graph
+    types, so its tensors carry dynamic shapes and placeholder `ttnn_layout`
+    encodings, whereas the graph values carry concrete static shapes and the
+    real `ttnn_layout`.
+
+    This pass forwards the graph value (the `tensor.cast` source) into the
+    consuming `ttnn.generic` operands, replacing the kernel-side type with the
+    graph static shape and `ttnn_layout`. The now-redundant boundary casts
+    become identity/chained casts that a subsequent canonicalization folds away.
+
+    Note: this pass only propagates SSA tensor types. It does not rewrite the
+    `program` attribute (CB formats, core ranges/grid) of `ttnn.generic`.
+  }];
+}
+
 def TTNNConfigureCCLOps : Pass<"ttnn-configure-ccl-ops", "::mlir::ModuleOp"> {
   let summary = "Configure device-specific parameters on CCL operations.";
   let description = [{
