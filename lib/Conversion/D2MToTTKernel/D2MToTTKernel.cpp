@@ -717,11 +717,12 @@ static Value computeLinearIndex(Location loc, ArrayRef<int64_t> shape,
   return linearIdx;
 }
 
-// A scalar (non-tile) read of an L1 buffer, which is only meaningful on the
-// RISC-V data movement cores where it is a plain pointer dereference into the
-// buffer's L1 address. Everything else in a thread region is tile-granular: a
-// memref.load in a compute region does not read anything, it merely
-// materializes a CB slot index (see MemrefLoadRewriter below).
+// A scalar (non-tile) read of an L1 buffer: a plain pointer dereference into
+// the buffer's L1 address performed by the RISC-V core, on either a
+// datamovement or a compute thread. It is distinguished from the tile-granular
+// meaning of memref.load in a compute region -- which reads nothing and merely
+// materializes a CB slot index (see MemrefLoadRewriter below) -- by its integer
+// (non-tile) element type.
 //
 // Anything with the shape of a scalar L1 access that this returns false for has
 // already been rejected by checkScalarL1AccessSupport in the pass, so the
@@ -732,8 +733,10 @@ static bool isSupportedScalarL1Load(memref::LoadOp op) {
     return false;
   }
   auto threadAttr = func->getAttrOfType<d2m::ThreadAttr>(d2m::ThreadAttr::name);
-  if (!threadAttr ||
-      threadAttr.getThreadType() != d2m::ThreadType::Datamovement) {
+  // Scalar L1 reads lower to ttkernel.load_from_l1 on both datamovement and
+  // compute threads (the compute thread reads the L1-staged value back for
+  // control flow), so any kernel thread is acceptable here.
+  if (!threadAttr) {
     return false;
   }
   MemRefType memrefType = op.getMemRefType();

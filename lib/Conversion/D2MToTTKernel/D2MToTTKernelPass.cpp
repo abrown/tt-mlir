@@ -54,8 +54,6 @@ static LogicalResult checkScalarL1AccessSupport(func::FuncOp funcOp) {
     // Not a kernel thread; host command functions keep their own semantics.
     return success();
   }
-  const bool isDatamovement =
-      threadAttr.getThreadType() == d2m::ThreadType::Datamovement;
 
   auto check = [&](Operation *op, MemRefType memrefType,
                    bool isStore) -> LogicalResult {
@@ -67,12 +65,13 @@ static LogicalResult checkScalarL1AccessSupport(func::FuncOp funcOp) {
              << "scalar stores to L1 are not supported; only scalar loads (the "
                 "dependent-load primitive) are";
     }
-    if (!isDatamovement) {
-      return op->emitOpError()
-             << "scalar L1 access is only supported on a datamovement thread; "
-                "in a compute region memref.load is tile-granular and does not "
-                "read a value";
-    }
+    // Scalar L1 reads are legal on both datamovement and compute threads: a
+    // value read from DRAM by the datamovement core is staged into an L1 CB and
+    // then read back by the compute core as well (the shared-memory / local
+    // load pattern), so grouped-mm-style control flow that depends on the
+    // loaded value can live on the compute thread. The scalar (int element
+    // type) read is distinct from the tile-index meaning of a compute-region
+    // memref.load, which operates on !ttcore.tile-typed CBs.
     if (!d2m::utils::isSupportedScalarL1ElementType(
             memrefType.getElementType())) {
       return op->emitOpError()
@@ -157,9 +156,10 @@ struct ConvertD2MToTTKernel
              !mlir::isa<ttcore::TileType>(memrefType.getElementType());
     };
 
-    // A scalar read of an L1 buffer inside a datamovement thread is a real read
+    // A scalar read of an L1 buffer inside a kernel thread is a real read
     // performed by the RISC-V core; it lowers to ttkernel.load_from_l1 and so
-    // must be illegal here. checkScalarL1AccessSupport has already rejected
+    // must be illegal here. This applies to both datamovement and compute
+    // threads (see checkScalarL1AccessSupport), which has already rejected
     // every other shape that would land in this predicate.
     auto isScalarL1Load = [](memref::LoadOp op) {
       auto func = op->getParentOfType<func::FuncOp>();
@@ -168,9 +168,7 @@ struct ConvertD2MToTTKernel
       }
       auto threadAttr =
           func->getAttrOfType<d2m::ThreadAttr>(d2m::ThreadAttr::name);
-      return threadAttr &&
-             threadAttr.getThreadType() == d2m::ThreadType::Datamovement &&
-             d2m::utils::isScalarL1AccessType(op.getMemRefType());
+      return threadAttr && d2m::utils::isScalarL1AccessType(op.getMemRefType());
     };
 
     // Allow loads and stores to integer element types, i.e. riscv accesses to

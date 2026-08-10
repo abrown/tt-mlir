@@ -376,7 +376,15 @@ static LogicalResult insertCBOpsForCompute(
       rewriter.create<PushOp>(first->getLoc(), cbHandle);
     }
     WaitOp waitOp = rewriter.create<WaitOp>(first->getLoc(), cbHandle);
-    rewriter.setInsertionPointAfter(last);
+    // The pop goes after the last CB access, but that access may be a scalar
+    // value that is loop-carried, making the block terminator (e.g. scf.yield)
+    // the last "use". The CB memory was already read before the terminator, so
+    // clamp the pop to just before it rather than emitting past the terminator.
+    if (last->hasTrait<mlir::OpTrait::IsTerminator>()) {
+      rewriter.setInsertionPoint(last);
+    } else {
+      rewriter.setInsertionPointAfter(last);
+    }
     rewriter.create<PopOp>(last->getLoc(), cbHandle);
 
     for (OpOperand *use : sync.uses) {
@@ -404,7 +412,11 @@ static LogicalResult insertCBOpsForCompute(
     auto cbHandle =
         d2m::getOrCreateCB(rewriter, generic, computeBlock, cbOperandIdx);
     auto reserveOp = rewriter.create<ReserveOp>(first->getLoc(), cbHandle);
-    rewriter.setInsertionPointAfter(last);
+    if (last->hasTrait<mlir::OpTrait::IsTerminator>()) {
+      rewriter.setInsertionPoint(last);
+    } else {
+      rewriter.setInsertionPointAfter(last);
+    }
     rewriter.create<PushOp>(last->getLoc(), cbHandle);
 
     // Aliased remote_store consumer has no DMA, so compute waits+pops.
