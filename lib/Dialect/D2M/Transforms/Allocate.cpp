@@ -1600,6 +1600,17 @@ class D2MAllocate final : public impl::D2MAllocateBase<D2MAllocate> {
          placement < PlannerSpace::end; ++placement) {
       const MemorySpace memspace = asMemorySpace(placement);
       MemRefType remapped = remap(rewriter, type, memspace);
+
+      // A bound DRAM external input may have a dynamic shape (e.g. a
+      // dependent-load index buffer modelled as a `[?, 1, 1, 1]` shard whose
+      // grid dim is indexed at runtime). Its buffer is provided by the runtime
+      // and consumes no L1 scratch, so it carries no allocation footprint here;
+      // sizing it via the (negative) dynamic extents would be meaningless.
+      if (!remapped.hasStaticShape()) {
+        sizes[ordinal(placement)] = 0;
+        continue;
+      }
+
       int64_t sizeBytes = getMemrefSizeBytes(remapped, device);
 
       // This function returns the aligned allocation size on each core.
