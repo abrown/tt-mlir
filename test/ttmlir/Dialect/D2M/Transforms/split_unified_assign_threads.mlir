@@ -120,6 +120,53 @@ module attributes {ttcore.system_desc = #system_desc} {
     return
   }
 
+  // A reduction accumulator is carried through an scf.for as a loop-carried
+  // memref, so the remote_store's local buffer is the scf.for RESULT rather than
+  // a direct generic operand. d2m-assign-threads must walk back through the loop
+  // (result -> yielded value) to find the underlying operand before lowering to
+  // explicit-CB form; otherwise getOperandIndex aborts.
+  // CHECK-LABEL: func.func @assign_loop_carried_accumulator
+  func.func @assign_loop_carried_accumulator(
+      %arg0: memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram>,
+      %arg1: memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram>) {
+    %stream_in = d2m.view_layout %arg0 remapping = #map4 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram> -> memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>
+    %stream_out = d2m.view_layout %arg1 remapping = #map4 : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #dram> -> memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>
+    %cb_in = memref.alloc() {address = 5120 : i64, alignment = 16 : i64} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    %cb_acc_init = memref.alloc() {address = 6144 : i64, alignment = 16 : i64} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    %cb_acc = memref.alloc() {address = 7168 : i64, alignment = 16 : i64} : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+
+    // CHECK: d2m.remote_load %{{.*}} into %{{.*}} {d2m.thread = #d2m.thread<datamovement>}
+    // CHECK: linalg.generic
+    // CHECK-SAME: {d2m.thread = #d2m.thread<compute>}
+    // The store's buffer is the scf.for result; it is still lowered and tagged.
+    // CHECK: d2m.remote_store %{{.*}} from %{{.*}} {d2m.thread = #d2m.thread<datamovement>}
+    d2m.generic {block_factors = [], grid = #ttcore.grid<2x4>, indexing_maps = [], iterator_types = [], threads = [#d2m.thread<unified>]}
+        ins(%stream_in : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>)
+        outs(%stream_out : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>)
+        additionalArgs(%cb_in, %cb_acc_init, %cb_acc : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>, memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>, memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>) {
+    ^unified0:
+      %core0 = d2m.core_index(0) : index
+      %core1 = d2m.core_index(1) : index
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c4 = arith.constant 4 : index
+      %acc = scf.for %k = %c0 to %c4 step %c1 iter_args(%acc_iter = %cb_acc_init) -> (memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>) {
+        d2m.remote_load %cb_in %stream_in[%core0, %core1] : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>, memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>
+        linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel", "parallel"]} ins(%acc_iter, %cb_in : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>, memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>) outs(%cb_acc : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>) {
+        ^bb0(%a: !ttcore.tile<32x32, f32>, %in: !ttcore.tile<32x32, f32>, %out: !ttcore.tile<32x32, f32>):
+          %s = "d2m.tile_add"(%a, %in) : (!ttcore.tile<32x32, f32>, !ttcore.tile<32x32, f32>) -> !ttcore.tile<32x32, f32>
+          linalg.yield %s : !ttcore.tile<32x32, f32>
+        }
+        scf.yield %cb_acc : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+      }
+      d2m.remote_store %stream_out[%core0, %core1] %acc : memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.view<4>, #dram>, memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    }
+    memref.dealloc %cb_in : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    memref.dealloc %cb_acc_init : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    memref.dealloc %cb_acc : memref<2x4x!ttcore.tile<32x32, f32>, #ttcore.cb_layout<16384x4096, 2>, #l1>
+    return
+  }
+
   // Non-unified generics are left untouched (no thread annotations added).
   // CHECK-LABEL: func.func @assign_non_unified
   func.func @assign_non_unified(%arg0: memref<2x4x2x4x!ttcore.tile<32x32, f32>, #ttcore.shard<16384x4096, 1>, #l1>) {

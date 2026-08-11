@@ -10,6 +10,7 @@
 #include "ttmlir/Dialect/D2M/Utils/CBUtils.h"
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 
 namespace mlir::tt::d2m {
@@ -43,6 +44,42 @@ static bool isAliasedLoad(RemoteLoadOp loadOp) {
   return operandAliasOp && operandAliasOp.getMemref() == loadOp.getMemref();
 }
 
+// A data-movement op's local buffer may be threaded through one or more
+// scf.for loops as a loop-carried value (e.g. a reduction accumulator), in
+// which case the SSA value seen at the DMA op is an scf.for result or an
+// iter_arg block argument rather than a direct GenericOp operand. Walk back
+// through the loop carrying to recover the underlying buffer that IS a generic
+// operand. Returns the original value if it is already an operand or if the
+// chain cannot be resolved (preserving the caller's operand-lookup assertion).
+static Value resolveToGenericOperand(GenericOp generic, Value buffer) {
+  auto isOperand = [&](Value v) {
+    return llvm::is_contained(generic.getOperands(), v);
+  };
+
+  // Bound the walk to guard against unexpected cycles in the carrying chain.
+  for (unsigned steps = 0; !isOperand(buffer) && steps < 64; ++steps) {
+    if (auto result = mlir::dyn_cast<OpResult>(buffer)) {
+      if (auto forOp = mlir::dyn_cast<scf::ForOp>(result.getOwner())) {
+        // Follow the loop result to the value yielded for that result index.
+        buffer = forOp.getYieldedValues()[result.getResultNumber()];
+        continue;
+      }
+    }
+    if (auto blockArg = mlir::dyn_cast<BlockArgument>(buffer)) {
+      if (auto forOp =
+              mlir::dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp())) {
+        // Follow an iter_arg region argument to its init operand.
+        if (auto init = forOp.getTiedLoopInit(blockArg)) {
+          buffer = init->get();
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  return buffer;
+}
+
 // Lower implicit-form data-movement ops (remote_load/store, local_copy) to
 // explicit-CB form in place. Aliased remote ops are left implicit: they have no
 // DMA transfer and become compute-side CB obligations handled by
@@ -60,7 +97,8 @@ static void lowerDMAOpsToExplicitCB(GenericOp generic, Block *block,
     if (loadOp.isExplicitCBForm() || isAliasedLoad(loadOp)) {
       continue;
     }
-    Value localBuffer = loadOp.getLocalBuffer();
+    Value localBuffer =
+        resolveToGenericOperand(generic, loadOp.getLocalBuffer());
     unsigned cbOperandIdx = generic.getOperandIndex(localBuffer);
 
     rewriter.setInsertionPoint(loadOp);
@@ -83,6 +121,7 @@ static void lowerDMAOpsToExplicitCB(GenericOp generic, Block *block,
     }
     Value localBuffer = storeOp.getLocalBuffer();
     assert(localBuffer && "could not find associated local buffer for store");
+    localBuffer = resolveToGenericOperand(generic, localBuffer);
     unsigned cbOperandIdx = generic.getOperandIndex(localBuffer);
 
     rewriter.setInsertionPoint(storeOp);
@@ -100,9 +139,11 @@ static void lowerDMAOpsToExplicitCB(GenericOp generic, Block *block,
       continue;
     }
     Location loc = copyOp.getLoc();
-    unsigned srcCbOperandIdx = generic.getOperandIndex(copyOp.getSrc());
+    unsigned srcCbOperandIdx = generic.getOperandIndex(
+        resolveToGenericOperand(generic, copyOp.getSrc()));
     auto srcCb = d2m::getOrCreateCB(rewriter, generic, block, srcCbOperandIdx);
-    unsigned dstCbOperandIdx = generic.getOperandIndex(copyOp.getDst());
+    unsigned dstCbOperandIdx = generic.getOperandIndex(
+        resolveToGenericOperand(generic, copyOp.getDst()));
     auto dstCb = d2m::getOrCreateCB(rewriter, generic, block, dstCbOperandIdx);
 
     rewriter.setInsertionPoint(copyOp);
