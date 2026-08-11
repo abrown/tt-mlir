@@ -385,8 +385,16 @@ createCBDescriptors(Builder &builder, d2m::GenericOp op,
       continue;
     }
 
-    TT_assertv(mlir::isa<ttcore::TileType>(cbMemref.getElementType()),
-               "Only TileType supported.");
+    // Only L1 memrefs are circular buffers. Other device memrefs (e.g. a DRAM
+    // buffer forwarded to the kernel for a dependent load) are threaded as
+    // buffer-address runtime args, not CBs.
+    if (!ttcore::isL1MemorySpace(ttcore::getMemorySpace(cbMemref))) {
+      continue;
+    }
+
+    // Non-tile (scalar) element types are supported for dependent-load staging
+    // CBs. getMemrefCBPageSizeBytes wraps a scalar element in a tile to size
+    // the page, and elementTypeToDataType maps the scalar element type.
     ttcore::DataType dtype =
         ttcore::elementTypeToDataType(cbMemref.getElementType());
     size_t pageSize = device.getMemrefCBPageSizeBytes(cbMemref);
